@@ -311,3 +311,33 @@ footer {
     display: none;
   }
 }
+
+
+details {
+	padding-left: 1em;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: bold;
+
+}
+
+details .tree-content {
+  margin-left: 1em;
+}
+
+
+details {
+	padding-left: 1em;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: bold;
+
+}
+
+details .tree-content {
+  margin-left: 1em;
+}

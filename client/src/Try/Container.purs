@@ -3,14 +3,15 @@ module Try.Container where
 import Prelude
 
 import Ace (Annotation)
-import Control.Monad.Except (runExceptT)
+import Control.Monad.Except (runExcept, runExceptT)
+import Data.Array (elem)
 import Data.Array as Array
 import Data.Either (Either(..), either)
 import Data.Foldable (for_, oneOf, fold, traverse_)
 import Data.FoldableWithIndex (foldMapWithIndex)
 import Data.Maybe (Maybe(..), fromMaybe, isNothing)
-import Data.String as String
 import Data.String (Pattern(..))
+import Data.String as String
 import Data.String.Regex as Regex
 import Data.String.Regex.Flags as RegexFlags
 import Effect (Effect)
@@ -18,13 +19,14 @@ import Effect.Aff (Aff, Milliseconds(..), delay, makeAff)
 import Effect.Aff as Aff
 import Effect.Class.Console (error)
 import Effect.Uncurried (EffectFn3, runEffectFn3)
-import Partial.Unsafe (unsafeCrashWith)
 import Halogen as H
 import Halogen.HTML as HH
 import Halogen.HTML.Events as HE
 import Halogen.HTML.Properties as HP
+import Partial.Unsafe (unsafeCrashWith)
 import Try.API (CompileError(..), CompileResult(..), CompilerError, ErrorPosition)
 import Try.API as API
+import Try.CSTBuilder as CSTBuilder
 import Try.Config as Config
 import Try.Editor (MarkerType(..), toStringMarkerType)
 import Try.Editor as Editor
@@ -32,25 +34,33 @@ import Try.Gist (getGistById, tryLoadFileFromGist)
 import Try.GitHub (getRawGitHubFile)
 import Try.QueryString (compressToEncodedURIComponent, decompressFromEncodedURIComponent, getQueryStringMaybe, setQueryString)
 import Try.SharedConfig as SharedConfig
+import Try.Utils (toParsedTree)
 import Type.Proxy (Proxy(..))
 import Web.HTML (window)
 import Web.HTML.Location (href)
 import Web.HTML.Window (alert, location)
 
-type Slots = ( editor :: Editor.Slot Unit, shareButton :: forall q o. H.Slot q o Unit )
+type Slots = ( editor :: Editor.Slot Unit
+             , shareButton :: forall q o. H.Slot q o Unit
+             , cst :: forall q o. H.Slot q o Unit   
+             )
 
 data SourceFile = GitHub String | Gist String
 
+data ShowMode = JS | CST | None
+
+derive instance Eq ShowMode
+
 type Settings =
   { autoCompile :: Boolean
-  , showJs :: Boolean
+  , showMode :: ShowMode
   , viewMode :: ViewMode
   }
 
 defaultSettings :: Settings
 defaultSettings =
   { autoCompile: true
-  , showJs: false
+  , showMode : None
   , viewMode: SideBySide
   }
 
@@ -58,6 +68,8 @@ type State =
   { settings :: Settings
   , sourceFile :: Maybe SourceFile
   , compiled :: Maybe (Either String CompileResult)
+  , parsed :: Maybe (Either String CSTBuilder.Tree)
+  -- , parsed :: Maybe CSTBuilder.Tree
   }
 
 data ViewMode
@@ -79,6 +91,7 @@ data Action
   | EncodeInURL String
   | UpdateSettings (Settings -> Settings)
   | Compile (Maybe String)
+  | Parse (Maybe String)
   | HandleEditor Editor.Output
 
 _editor :: Proxy "editor"
@@ -105,6 +118,7 @@ component = H.mkComponent
     { settings: defaultSettings
     , sourceFile: Nothing
     , compiled: Nothing
+    , parsed : Nothing
     }
 
   handleAction :: Action -> H.HalogenM State Action Slots o Aff Unit
@@ -116,14 +130,17 @@ component = H.mkComponent
       mbViewModeParam <- H.liftEffect $ getQueryStringMaybe "view"
       let viewMode = fromMaybe SideBySide $ parseViewModeParam =<< mbViewModeParam
 
-      mbShowJsParam <- H.liftEffect $ getQueryStringMaybe "js"
-      let showJs = mbShowJsParam == Just "true"
-
+      mbShowJsParam <- H.liftEffect $ getQueryStringMaybe "show"
+      let showMode = case fromMaybe "" mbShowJsParam of
+                      "js" -> JS
+                      "cst" -> CST
+                      otherwise -> None
+                       
       mbAutoCompile <- H.liftEffect $ getQueryStringMaybe "compile"
       let autoCompile = mbAutoCompile /= Just "false"
 
       H.modify_ _
-        { settings = { viewMode, showJs, autoCompile }
+        { settings = { viewMode, showMode , autoCompile }
         , sourceFile = sourceFile
         }
 
@@ -134,17 +151,30 @@ component = H.mkComponent
     UpdateSettings k -> do
       old <- H.get
       new <- H.modify \state -> state { settings = k state.settings }
-      when (old.settings.showJs /= new.settings.showJs) do
-        if new.settings.showJs then
+      when (old.settings.showMode /= new.settings.showMode) do
+        if JS `elem` [new.settings.showMode, old.settings.showMode] then
           H.liftEffect teardownIFrame
         else
-          handleAction $ Compile Nothing
+          case new.settings.showMode of 
+              CST -> handleAction $ Parse Nothing
+              JS -> handleAction $ Compile Nothing
+              otherwise -> pure unit 
 
     EncodeInURL text -> H.liftEffect do
       setQueryString "code" $ compressToEncodedURIComponent text
+    
+    Parse mbCode -> do
+        code <- case mbCode of
+                Nothing -> do
+                  mbText <- H.request _editor unit $ Editor.GetEditorContent
+                  pure $ fold $ join mbText
+                Just text ->
+                  pure text
+        H.modify_ _{ parsed = Just $ toParsedTree code } 
 
     Compile mbCode -> do
       H.modify_ _ { compiled = Nothing }
+      
       code <- case mbCode of
         Nothing -> do
           mbText <- H.request _editor unit $ Editor.GetEditorContent
@@ -178,7 +208,7 @@ component = H.mkComponent
 
         Right res@(Right (CompileSuccess { js, warnings })) -> do
           { settings } <- H.get
-          if settings.showJs then do
+          if settings.showMode /= None then do
             H.liftEffect teardownIFrame
             H.modify_ _ { compiled = Just res }
           else do
@@ -205,8 +235,12 @@ component = H.mkComponent
 
     HandleEditor (Editor.TextChanged text) -> do
       _ <- H.fork $ handleAction $ EncodeInURL text
-      { autoCompile } <- H.gets _.settings
-      when autoCompile $ handleAction $ Compile $ Just text
+      { autoCompile, showMode } <- H.gets _.settings
+      when autoCompile $ 
+          case showMode of
+               JS -> handleAction $ Compile $ Just text
+               CST -> handleAction $ Parse $ Just text
+               None -> pure unit
 
   render :: State -> H.ComponentHTML Action Slots Aff
   render state =
@@ -320,13 +354,13 @@ component = H.mkComponent
         , HH.li
             [ HP.class_ $ HH.ClassName "menu-item nowrap" ]
             [ HH.input
-                [ HP.id "showjs"
+                [ HP.id "howjs"
                 , HP.name "showjs"
                 , HP.title "Show resulting JavaScript code instead of output"
                 , HP.value "showjs"
                 , HP.type_ HP.InputCheckbox
-                , HP.checked state.settings.showJs
-                , HE.onChecked \bool -> UpdateSettings (_ { showJs = bool })
+                , HP.checked $ state.settings.showMode == JS
+                , HE.onChecked \bool -> UpdateSettings (_ { showMode = if bool then JS else None })
                 ]
             , HH.label
                 [ HP.id "showjs_label"
@@ -334,6 +368,24 @@ component = H.mkComponent
                 , HP.title "Show resulting JavaScript code instead of output"
                 ]
                 [ HH.text "Show JS" ]
+            ]
+        , HH.li
+            [ HP.class_ $ HH.ClassName "menu-item nowrap" ]
+            [ HH.input
+                [ HP.id "showcst"
+                , HP.name "showcst"
+                , HP.title "Show CST"
+                , HP.value "showcst"
+                , HP.type_ HP.InputCheckbox
+                , HP.checked $ state.settings.showMode == CST
+                , HE.onChecked \bool -> UpdateSettings (_ { showMode = if bool then CST else None })
+                ]
+            , HH.label
+                [ HP.id "showcst_label"
+                , HP.for "showcst"
+                , HP.title "Show CST"
+                ]
+                [ HH.text "Show CST" ]
             ]
         , HH.slot_ (Proxy :: _ "shareButton") unit shareButton unit
         , HH.li
@@ -377,8 +429,12 @@ component = H.mkComponent
             [ HP.id "column2_wrapper" ]
             [ HH.div
                 [ HP.id "column2" ]
-                [ maybeElem state.compiled renderCompiled ]
-            , whenElem (isNothing state.compiled) \_ ->
+                [ if state.settings.showMode == CST
+                  then maybeElem state.parsed renderParsed
+                  else maybeElem state.compiled renderCompiled
+                ]
+            , whenElem ((state.settings.showMode == CST && isNothing state.parsed) 
+                        && (state.settings.showMode /= JS && isNothing state.compiled)) \_ ->
                 HH.div
                   [ HP.id "loading" ]
                   [ ]
@@ -404,6 +460,9 @@ component = H.mkComponent
         , footerLink "Package set version:" SharedConfig.packageSetVersion SharedConfig.packageSetPackageJsonUrl
         ]
 
+    renderParsed (Left err) = renderPlaintext err
+    renderParsed (Right c) = HH.slot_ (Proxy @"cst") unit CSTBuilder.component c
+
     renderCompiled = case _ of
       Left err ->
         renderPlaintext err
@@ -414,7 +473,7 @@ component = H.mkComponent
           CompilerErrors errs ->
             HH.div_ $ renderCompilerErrors errs
         CompileSuccess { js } ->
-          whenElem state.settings.showJs \_ ->
+          whenElem (state.settings.showMode == JS)  \_ ->
             renderPlaintext js
 
 whenElem :: forall w i. Boolean -> (Unit -> HH.HTML w i) -> HH.HTML w i

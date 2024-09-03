@@ -16,6 +16,9 @@
   , "either"
   , "exceptions"
   , "foldable-traversable"
+  , "foreign"
+  , "language-cst-parser"
+  , "foreign-generic"
   , "foreign-object"
   , "functions"
   , "functors"
@@ -39,6 +42,7 @@
   , "tuples"
   , "unsafe-coerce"
   , "web-html"
+  , "debug"
   ]
 , packages = ./packages.dhall
 , sources = [ "src/**/*.purs", "test/**/*.purs" ]
